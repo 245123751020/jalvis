@@ -160,32 +160,35 @@ class ChatPanel(QWidget):
         self.last_submitted = ""
         self.pending = ""
         self.setWindowTitle("JARVIS")
-        self.resize(360, 430)
+        self.resize(330, 118)
         self.setStyleSheet("""
-            QWidget#panel { background: #0d1522; border: 1px solid #2c4466; border-radius: 12px; }
-            QTextBrowser { background: transparent; border: none; padding: 4px 2px; }
-            QLineEdit { background: #152038; border: 1px solid #38527a; border-radius: 16px;
-                        padding: 9px 14px; font-size: 14px; color: #eef6fb; }
+            QWidget#panel { background: #0d1522; border: 1px solid #2c4466; border-radius: 20px; }
+            QLabel#reply { color: #d9ecf5; font-size: 13px; background: transparent; padding: 0 8px; }
+            QLabel#busy { color: #6fc9e0; font-size: 11px; padding: 0 8px; }
+            QLineEdit { background: #152038; border: 1px solid #38527a; border-radius: 14px;
+                        padding: 5px 14px; font-size: 13px; color: #eef6fb; min-height: 24px; }
             QLineEdit:focus { border: 1px solid #3da3c9; }
-            QLabel#busy { color: #6fc9e0; font-size: 12px; padding-left: 8px; }
-            QPushButton { background: #223750; border: 1px solid #3a5275; border-radius: 12px;
-                          padding: 5px 12px; color: #b8ecf7; }
+            QPushButton { background: #223750; border: 1px solid #3a5275; border-radius: 11px;
+                          padding: 3px 10px; font-size: 12px; color: #b8ecf7; }
             QPushButton:hover { background: #2b4a68; }
         """)
         self.setObjectName("panel")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(12, 12, 12, 10)
-        layout.setSpacing(6)
-        self.reply = QTextBrowser()
-        self.reply.setOpenLinks(False)
-        layout.addWidget(self.reply, 1)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(3)
+        self.reply = QLabel("")
+        self.reply.setObjectName("reply")
+        self.reply.setWordWrap(True)
+        self.reply.setMaximumHeight(42)
+        self.reply.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        layout.addWidget(self.reply)
         self.busy = QLabel("working…")
         self.busy.setObjectName("busy")
         self.busy.hide()
         layout.addWidget(self.busy)
         self.input = QLineEdit()
         self.input.setMaxLength(2000)
-        self.input.setPlaceholderText("Ask JARVIS…  (Enter to send)")
+        self.input.setPlaceholderText("Ask JARVIS…")
         self.input.returnPressed.connect(self.submit)
         layout.addWidget(self.input)
         self.confirm_row = QWidget()
@@ -212,11 +215,7 @@ class ChatPanel(QWidget):
         body = html.escape(text)
         body = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", body)
         body = body.replace("\n", "<br>")
-        color = "#57dfed" if speaker == "Jarvis" else "#9fb8cc"
-        self.reply.setHtml(
-            f'<p><span style="color:{color};font-weight:bold">{html.escape(speaker)}</span><br>{body}</p>'
-        )
-        self.reply.verticalScrollBar().setValue(self.reply.verticalScrollBar().maximum())
+        self.reply.setText(body)
 
     def _animate_busy(self):
         self.busy_phase = (self.busy_phase + 1) % 4
@@ -325,12 +324,12 @@ class ChatPanel(QWidget):
 
     def show_near_orb(self):
         screen = self.orb.screen().availableGeometry()
-        self.resize(min(360, screen.width()), min(430, screen.height()))
+        self.resize(min(330, screen.width()), min(105, screen.height()))
         x = self.orb.x() - self.width() - 12
         if x < screen.left():
             x = self.orb.x() + self.orb.width() + 12
         x = max(screen.left(), min(x, screen.right() - self.width() + 1))
-        y = max(screen.top(), min(self.orb.y() - 90, screen.bottom() - self.height() + 1))
+        y = max(screen.top(), min(self.orb.y() - 105, screen.bottom() - self.height() + 1))
         self.move(x, y)
         self.show()
         self.raise_()
