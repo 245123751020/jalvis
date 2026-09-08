@@ -15,11 +15,16 @@ local-command mode.
 
 - "hey jarvis, what time is it?" → answers and shows the time
 - "open firefox" / "open youtube" / "search python tutorial, please"
+- "open youtube and search for cats" → both actions run in one turn
 - "turn the volume up", "mute", "lock the screen"
 - "what apps can you open?" → calls `apps`
+- "close the chrome", "close firefox"
 - any small talk works without touching the computer
 - unknown app names are still passed to `open <name>` so the local index can
   suggest close matches instead of launching something wrong
+
+While a request runs, the panel shows an animated spinner and the orb turns
+amber; each completed action is confirmed with a ✓ line before the spoken reply.
 
 The key is read from `$GROQ_API_KEY`, then `~/.config/jarvis/groq_key`
 (created with permissions 600 — it is never stored in source code). The model
@@ -28,6 +33,7 @@ is auto-selected from the account's active list (default `qwen/qwen3.8-27b`).
 ## Offline commands
 
 - `open firefox`, `open chrome`, `open code`, `open terminal`, `open calculator`
+- `close chrome`, `close firefox`, `close terminal`, `close code`
 - `apps` lists launchable installed apps; use `open <app name>` to launch one.
 - `open youtube`, `open github`, `open gmail`, `open example.com`
 - `search Python tutorial`, `search youtube for relaxing music`

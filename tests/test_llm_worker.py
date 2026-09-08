@@ -80,7 +80,7 @@ class LLMWorkerTests(unittest.TestCase):
         self.assertEqual(commands, ["time"])
         self.assertEqual(len(replies), 1)
         self.assertFalse(failures)
-        self.assertIn("open", replies[0])
+        self.assertEqual(replies[0], "Done — that's the answer.")
 
     def test_multi_call_in_one_message(self):
         client = FakeClient([

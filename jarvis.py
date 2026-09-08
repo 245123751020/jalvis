@@ -176,10 +176,9 @@ class ChatPanel(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 10)
         layout.setSpacing(6)
-        self.history = QTextBrowser()
-        self.history.setOpenLinks(False)
-        self.history.document().setMaximumBlockCount(500)
-        layout.addWidget(self.history, 1)
+        self.reply = QTextBrowser()
+        self.reply.setOpenLinks(False)
+        layout.addWidget(self.reply, 1)
         self.busy = QLabel("working…")
         self.busy.setObjectName("busy")
         self.busy.hide()
@@ -208,15 +207,16 @@ class ChatPanel(QWidget):
         self.append("Jarvis", "Ready. Ask me anything — try “open chatgpt” or “what time is it?”")
 
     def append(self, speaker, text):
+        """Show a single reply (replaces whatever was shown before)."""
         import html
         body = html.escape(text)
         body = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", body)
         body = body.replace("\n", "<br>")
         color = "#57dfed" if speaker == "Jarvis" else "#9fb8cc"
-        self.history.append(
+        self.reply.setHtml(
             f'<p><span style="color:{color};font-weight:bold">{html.escape(speaker)}</span><br>{body}</p>'
         )
-        self.history.verticalScrollBar().setValue(self.history.verticalScrollBar().maximum())
+        self.reply.verticalScrollBar().setValue(self.reply.verticalScrollBar().maximum())
 
     def _animate_busy(self):
         self.busy_phase = (self.busy_phase + 1) % 4
@@ -245,10 +245,10 @@ class ChatPanel(QWidget):
         self.pending = ""
         self.confirm_row.hide()
         if text.casefold() == "clear":
-            self.history.clear()
+            self.reply.clear()
             self.messages = []
             return
-        self.append("You", text)
+        # No echoing of the user's own text — the reply replaces the previous one.
         self.last_submitted = text
         if self.llm is not None:
             self.messages.append({"role": "user", "content": text})
