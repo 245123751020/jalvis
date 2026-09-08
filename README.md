@@ -1,11 +1,31 @@
-# JARVIS local desktop assistant
+# JARVIS desktop assistant (Groq + local)
 
 Run `/home/mvsr/jarvis/start_jarvis.sh`. Click the glowing J orb to open
 the chat panel. Drag the orb to reposition it. Right-click for floating and quit
 controls. Escape or the panel's close button hides chat without quitting.
 The orb gently bobs around its position rather than roaming across your work.
 
-## Commands
+When a Groq API key is available the orb answers naturally (small talk, questions)
+and performs desktop actions through function calling: the model picks a
+`run_action` command, the local engine executes it on your machine, and the
+model confirms in words. Without a key or network it still works in offline
+local-command mode.
+
+## Natural conversation (Groq)
+
+- "hey jarvis, what time is it?" → answers and shows the time
+- "open firefox" / "open youtube" / "search python tutorial, please"
+- "turn the volume up", "mute", "lock the screen"
+- "what apps can you open?" → calls `apps`
+- any small talk works without touching the computer
+- unknown app names are still passed to `open <name>` so the local index can
+  suggest close matches instead of launching something wrong
+
+The key is read from `$GROQ_API_KEY`, then `~/.config/jarvis/groq_key`
+(created with permissions 600 — it is never stored in source code). The model
+is auto-selected from the account's active list (default `qwen/qwen3.8-27b`).
+
+## Offline commands
 
 - `open firefox`, `open chrome`, `open code`, `open terminal`, `open calculator`
 - `apps` lists launchable installed apps; use `open <app name>` to launch one.
@@ -25,14 +45,17 @@ use standard English folder names under your home directory.
 
 ## Scope and safety
 
-This is a typed, rule-based assistant, not an LLM or a voice assistant. No API
-keys, new packages, or cloud processing are needed. Web requests naturally use
-your internet connection and browser. Chat is held in memory, not saved to disk.
-Input is never evaluated as shell commands. Only HTTP(S) URLs are supported.
-Screenshot automation and global hotkeys are not implemented.
+Chat goes to Groq's API over HTTPS while connected — do not send passwords or
+secrets through the panel. Input is never evaluated as shell commands, and the
+local command engine is an explicit whitelist (also enforced in offline mode).
+Only HTTP(S) URLs are supported. Chat history is kept in memory, not saved to
+disk, and is trimmed to the most recent 24 messages. Screenshot automation and
+global hotkeys are not implemented. If Groq becomes unreachable the panel
+switches to offline local mode automatically.
 
 Requires the existing Python/PyQt5 environment at
-`/home/mvsr/anaconda3/bin/python3`. Launches use OS desktop tools.
+`/home/mvsr/anaconda3/bin/python3`; the Groq client uses only the standard
+library. Launches use OS desktop tools.
 Uses Qt's xcb backend through XWayland on GNOME Wayland. Always-on-top behavior
 is a window-manager hint; fullscreen apps and desktop policies may override it.
 Transparent margins may receive mouse events; this is not a click-through overlay.
@@ -54,4 +77,4 @@ cd /home/mvsr/jarvis
 ```
 
 Tests mock desktop actions so they don't open applications or change power state.
-The smoke test briefly displays the orb and chat, then exits automatically.# jalvis
+The smoke test briefly displays the orb and chat, then exits automatically.
