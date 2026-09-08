@@ -12,7 +12,8 @@ from apps_index import AppIndex
 
 HELP = """Try these commands:
 • open firefox / chrome / code / terminal / calculator / files
-• open youtube / github / gmail / google
+• close chrome / firefox / terminal / code
+• open youtube / github / gmail / google / chatgpt / claude
 • open example.com (or an https:// URL)
 • search Python tutorial
 • search youtube for relaxing music
@@ -26,6 +27,23 @@ HELP = """Try these commands:
 Right-click the orb to pause floating or quit. Drag it to move it.
 When Groq is connected you can also just talk to me naturally.
 Otherwise this offline mode understands local commands."""
+
+# Processes we can safely close (process name -> likely pkill targets).
+CLOSE_PROCESSES = {
+    "chrome": ["google-chrome", "chrome", "chromium", "chromium-browser"],
+    "firefox": ["firefox"],
+    "terminal": ["gnome-terminal", "kgx", "konsole", "x-terminal-emulator"],
+    "code": ["code"],
+    "vs code": ["code"],
+    "files": ["nautilus"],
+    "nautilus": ["nautilus"],
+    "calculator": ["gnome-calculator", "qalculate-gtk"],
+    "spotify": ["spotify"],
+    "vlc": ["vlc"],
+    "gimp": ["gimp"],
+    "discord": ["discord"],
+    "blender": ["blender"],
+}
 
 
 @dataclass(frozen=True)
@@ -65,6 +83,48 @@ class CommandEngine:
             return Result(message)
         except OSError as error:
             return Result(f"Couldn't launch it: {error}")
+
+    def _open_url(self, url, message):
+        """Open a URL/folder with a fallback chain so it actually happens."""
+        candidates = [("xdg-open", [url]), ("gio", ["open", url])]
+        for tool, args in candidates:
+            executable = self._tool(tool)
+            if not executable:
+                continue
+            try:
+                process = subprocess.Popen(
+                    [executable, *args], stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except OSError:
+                continue
+            try:
+                code = process.wait(timeout=0.6)
+                if code == 0:
+                    return Result(message)
+            except subprocess.TimeoutExpired:
+                import threading
+                threading.Thread(target=process.wait, daemon=True).start()
+                return Result(message)
+        # Last resort: open directly in an installed browser, new tab.
+        for browser in ("sensible-browser", "firefox", "google-chrome", "chromium"):
+            executable = self._tool(browser)
+            if not executable:
+                continue
+            launch = [executable]
+            if browser != "sensible-browser":
+                launch.append("--new-tab")
+            launch.append(url)
+            try:
+                subprocess.Popen(
+                    launch, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL, start_new_session=True,
+                )
+                return Result(message)
+            except OSError:
+                continue
+        return Result("I couldn't open that — no browser or URL handler is available.")
 
     def _run(self, tool, args, message, timeout=8):
         executable = self._tool(tool)
@@ -131,7 +191,34 @@ class CommandEngine:
             youtube = re.match(r"youtube\s+for\s+(.+)$", query, re.I)
             base = "https://www.youtube.com/results?search_query=" if youtube else "https://www.google.com/search?q="
             query = youtube.group(1).strip() if youtube else query
-            return self._launch("xdg-open", [base + quote_plus(query)], f"Browser search requested: {query}")
+            return self._open_url(base + quote_plus(query), f"Browser search requested: {query}")
+        close_match = re.match(r"^(?:close|stop|kill|quit)\s+(.+)$", text, re.I)
+        if close_match:
+            app_name = close_match.group(1).strip()
+            key = app_name.casefold().replace("the ", "")
+            processes = CLOSE_PROCESSES.get(key)
+            if not processes:
+                # Try resolving to an installed app's binary so pkill is precise.
+                app = self.index.find(key)
+                if app and app.desktop_id:
+                    binary = app.desktop_id.removesuffix(".desktop") or None
+                    processes = [binary] if binary else []
+            if not processes:
+                return Result(f"I don't have a safe way to close '{app_name}'. Try 'apps' to see what I know.")
+            closed = False
+            for name in processes:
+                try:
+                    result = subprocess.run(
+                        ["pkill", "-TERM", "-x", name], capture_output=True, text=True, timeout=8
+                    )
+                    if result.returncode == 0:
+                        closed = True
+                        break
+                except (OSError, subprocess.TimeoutExpired):
+                    continue
+            if closed:
+                return Result(f"Requested closing {app_name}.")
+            return Result(f"{app_name} didn't appear to be running.")
         opening = re.match(r"^(?:open|launch|start)\s+(.+)$", text, re.I)
         if opening:
             target = opening.group(1).strip()
@@ -140,20 +227,26 @@ class CommandEngine:
                 "youtube": "https://www.youtube.com", "github": "https://github.com",
                 "gmail": "https://mail.google.com", "google": "https://www.google.com",
                 "whatsapp": "https://web.whatsapp.com", "chatgpt": "https://chatgpt.com",
+                "claude": "https://claude.ai", "gemini": "https://gemini.google.com",
+                "grok": "https://grok.com", "netflix": "https://www.netflix.com",
+                "spotify": "https://open.spotify.com", "instagram": "https://www.instagram.com",
+                "reddit": "https://www.reddit.com", "drive": "https://drive.google.com",
+                "maps": "https://maps.google.com", "translate": "https://translate.google.com",
+                "gpt": "https://chatgpt.com", "ai": "https://chatgpt.com",
             }
             if key in sites:
-                return self._launch("xdg-open", [sites[key]], f"Requested {target} in your browser.")
+                return self._open_url(sites[key], f"Requested {target} in your browser.")
             folders = {"home": Path.home(), **{n.lower(): Path.home() / n for n in ("Downloads", "Documents", "Desktop", "Pictures", "Music", "Videos")}}
             if key in folders:
                 if not folders[key].is_dir():
                     return Result(f"Folder not found: {folders[key]}")
-                return self._launch("xdg-open", [str(folders[key])], f"Requested folder: {folders[key]}")
+                return self._open_url(str(folders[key]), f"Requested folder: {folders[key]}")
             app = self.index.find(target)
             if app:
                 return self._launch("gio", ["launch", str(app.path)], f"Requested launch: {app.name}.")
             url = self.web_url(target)
             if url:
-                return self._launch("xdg-open", [url], f"Requested {url} in your browser.")
+                return self._open_url(url, f"Requested {url} in your browser.")
             suggestions = self.index.suggest(target)
             suffix = " Did you mean: " + ", ".join(suggestions) + "?" if suggestions else " Type 'apps' to see what's installed."
             return Result(f"I couldn't find '{target}'." + suffix)

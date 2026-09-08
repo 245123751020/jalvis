@@ -3,6 +3,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -43,10 +44,17 @@ def build_system_prompt():
         "You can perform actions on the computer with a single tool, run_action(command). "
         "Always reply in the same language the user writes in, and keep chat replies short "
         "(1-2 sentences) unless the user asks for more detail.\n\n"
-        "Call run_action with EXACTLY one command from this list whenever the user asks you "
-        "to DO something on the computer:\n"
+        "RULES:\n"
+        "- Whenever the user asks you to DO something (open, search, close, volume, lock, time, "
+        "date, apps, shutdown, play), you MUST call run_action with exactly one of the commands "
+        "below. NEVER say you opened/did something if you did not actually call run_action — "
+        "claiming without calling is a failure.\n"
+        "- If the user asks for several things in one message, call run_action once per thing.\n"
+        "- Never invent commands, tools, or URLs outside this list.\n\n"
+        "Available commands for run_action:\n"
         "- open <app name>    e.g. open firefox | open code | open terminal | open calculator | open files\n"
-        "- open <website>     e.g. open youtube | open github | open gmail | open example.com\n"
+        "- close <app name>   e.g. close chrome | close firefox | close terminal\n"
+        "- open <website>     e.g. open youtube | open github | open gmail | open chatgpt | open claude | open example.com\n"
         "- open <folder>      e.g. open downloads | open documents | open home\n"
         "- search <query>     e.g. search python tutorial\n"
         "- search youtube for <query>\n"
@@ -55,26 +63,42 @@ def build_system_prompt():
         "- time | date\n"
         "- apps    (lists installed applications)\n"
         "- shutdown    (the app will ask the user to confirm separately; still call the tool)\n\n"
-        "If the app name is unusual, still call run_action with 'open <their name>' so the "
-        "local system can look it up or suggest close matches. Never invent other commands "
-        "or tool names. For small talk, questions, or requests that don't require the computer, "
-        "just answer naturally WITHOUT calling the tool."
+        "For small talk, questions, or requests that don't need the computer, answer naturally "
+        "WITHOUT calling the tool."
     )
 
 
+ACTION_INTENT_RE = re.compile(
+    r"\b(open|launch|start|close|stop|quit|kill|search|google|play|volume|mute|unmute|"
+    r"lock|shutdown|power.?off|what.{0,8}(time|date)|today'?s date|apps|screenshot|open\s+\w+)\b",
+    re.I,
+)
+
+
 class LLMWorker(QThread):
-    """Runs a Groq chat round; when the model requests run_action, the command
-    is executed locally and the outcome is fed back for a natural reply."""
+    """Runs a Groq chat round. The model's run_action calls are executed locally
+    in a loop (so multi-step requests finish in one turn) and the outcome is
+    fed back for a natural reply."""
 
     reply = pyqtSignal(str)
-    actions = pyqtSignal(list)
+    action_done = pyqtSignal(str, str)
     need_confirm = pyqtSignal(str)
     failed = pyqtSignal(str)
 
-    def __init__(self, client, engine, messages, model, parent=None):
+    def __init__(self, client, engine, messages, model, force_action=False, parent=None):
         super().__init__(parent)
         self.client, self.engine = client, engine
         self.messages, self.model = messages, model
+        self.force_action = force_action
+
+    @staticmethod
+    def clean(text):
+        # Strip qwen/Hermes-style tool-call markup that leaks into plain replies.
+        text = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.S | re.I)
+        text = re.sub(r"<function[^>]*>.*?</function>", "", text, flags=re.S | re.I)
+        text = re.sub(r"<parameter[^>]*>.*?</parameter>", "", text, flags=re.S | re.I)
+        text = re.sub(r"<\|?endoftext\|?>", "", text, flags=re.I)
+        return text.strip()
 
     def run(self):
         try:
@@ -83,43 +107,48 @@ class LLMWorker(QThread):
             self.failed.emit(f"Groq error: {error}")
 
     def _run(self):
-        response = self.client.chat(
-            self.messages, model=self.model, tools=[RUN_ACTION_TOOL], tool_choice="auto"
-        )
-        message = response["choices"][0]["message"]
-        tool_calls = message.get("tool_calls")
-        if not tool_calls:
-            self.reply.emit(message.get("content") or "Done.")
-            return
-        tool_messages = [message]
+        messages = list(self.messages)
         outcomes = []
-        for call in tool_calls:
-            tool_id = call.get("id", "")
-            try:
-                arguments = json.loads(call["function"].get("arguments") or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
-            command = str(arguments.get("command", "")).strip()
-            if not command:
-                continue
-            result = self.engine.execute(command)
-            if result.confirm:
-                self.need_confirm.emit(result.confirm)
-                self.reply.emit(result.text)
-                return
-            tool_messages.append({"role": "tool", "tool_call_id": tool_id, "content": result.text})
-            outcomes.append((command, result.text))
-        # Second round: let the model phrase a natural reply about what happened.
-        try:
-            final = self.client.chat(
-                list(self.messages) + tool_messages, model=self.model,
-                tools=[RUN_ACTION_TOOL], tool_choice="none",
+        first_choice = (
+            {"type": "function", "function": {"name": "run_action"}} if self.force_action else "auto"
+        )
+        for _ in range(4):
+            response = self.client.chat(
+                messages, model=self.model, tools=[RUN_ACTION_TOOL],
+                tool_choice=first_choice, max_tokens=768,
             )
-            text = final["choices"][0]["message"].get("content") or "Done."
-        except Exception:
-            text = "; ".join(outcome[1] for outcome in outcomes) or "Done."
-        self.actions.emit(outcomes)
-        self.reply.emit(text)
+            first_choice = "auto"
+            message = response["choices"][0]["message"]
+            tool_calls = message.get("tool_calls")
+            if not tool_calls:
+                content = self.clean(message.get("content") or "")
+                self.reply.emit(content or "Done.")
+                return
+            # Forward the assistant message (with its tool_calls) back to the API.
+            assistant = {"role": "assistant", "content": message.get("content") or ""}
+            if tool_calls:
+                assistant["tool_calls"] = tool_calls
+            messages.append(assistant)
+            for call in tool_calls:
+                tool_id = call.get("id", "")
+                try:
+                    arguments = json.loads(call["function"].get("arguments") or "{}")
+                except json.JSONDecodeError:
+                    arguments = {}
+                command = str(arguments.get("command", "")).strip()
+                if not command:
+                    continue
+                result = self.engine.execute(command)
+                if result.confirm:
+                    self.need_confirm.emit(result.confirm)
+                    self.reply.emit(result.text)
+                    return
+                self.action_done.emit(command, result.text)
+                outcomes.append((command, result.text))
+                messages.append({"role": "tool", "tool_call_id": tool_id, "content": result.text})
+        # Loop budget exhausted but the model kept calling tools.
+        summary = "; ".join(text for _, text in outcomes) or "Done."
+        self.reply.emit(summary)
 
 
 class ChatPanel(QWidget):
@@ -130,80 +159,81 @@ class ChatPanel(QWidget):
         self.messages = []
         self.last_submitted = ""
         self.pending = ""
-        self.setWindowTitle("JARVIS — Groq Assistant")
-        self.resize(410, 510)
+        self.setWindowTitle("JARVIS")
+        self.resize(360, 430)
         self.setStyleSheet("""
-            QWidget { background: #101b2c; color: #e4f6ff; font-size: 14px; }
-            QLabel#heading { color: #57dfed; font-size: 20px; font-weight: bold; }
-            QTextBrowser { background: #0b1321; border: 1px solid #29405a;
-                           border-radius: 10px; padding: 10px; }
-            QLineEdit { background: #182a40; border: 1px solid #39738c;
-                        border-radius: 8px; padding: 10px; }
-            QPushButton { background: #223e56; border: none; border-radius: 7px;
-                          padding: 9px; color: #a8f4ff; }
-            QPushButton:hover { background: #305a72; }
-            QPushButton:disabled { color: #6a8295; }
+            QWidget#panel { background: #0d1522; border: 1px solid #2c4466; border-radius: 12px; }
+            QTextBrowser { background: transparent; border: none; padding: 4px 2px; }
+            QLineEdit { background: #152038; border: 1px solid #38527a; border-radius: 16px;
+                        padding: 9px 14px; font-size: 14px; color: #eef6fb; }
+            QLineEdit:focus { border: 1px solid #3da3c9; }
+            QLabel#busy { color: #6fc9e0; font-size: 12px; padding-left: 8px; }
+            QPushButton { background: #223750; border: 1px solid #3a5275; border-radius: 12px;
+                          padding: 5px 12px; color: #b8ecf7; }
+            QPushButton:hover { background: #2b4a68; }
         """)
+        self.setObjectName("panel")
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        header = QHBoxLayout()
-        title = QLabel("◉  J A R V I S")
-        title.setObjectName("heading")
-        header.addWidget(title)
-        header.addStretch()
-        close = QPushButton("✕")
-        close.setToolTip("Hide chat (Esc)")
-        close.clicked.connect(self.hide)
-        header.addWidget(close)
-        layout.addLayout(header)
-        if self.llm is not None:
-            subtitle = QLabel(f"GROQ ONLINE  •  {self.model}  •  {len(self.engine.index.apps)} apps indexed")
-        else:
-            subtitle = QLabel("LOCAL MODE  •  no API key / network")
-        subtitle.setStyleSheet("color: #91a9bd; font-size: 11px;")
-        layout.addWidget(subtitle)
+        layout.setContentsMargins(12, 12, 12, 10)
+        layout.setSpacing(6)
         self.history = QTextBrowser()
         self.history.setOpenLinks(False)
         self.history.document().setMaximumBlockCount(500)
-        layout.addWidget(self.history)
-        shortcuts = QHBoxLayout()
-        for label, command in [("Browser", "open google"), ("Files", "open files"), ("Help", "help")]:
-            button = QPushButton(label)
-            button.clicked.connect(lambda checked=False, cmd=command: self.submit(cmd))
-            shortcuts.addWidget(button)
-        layout.addLayout(shortcuts)
-        row = QHBoxLayout()
+        layout.addWidget(self.history, 1)
+        self.busy = QLabel("working…")
+        self.busy.setObjectName("busy")
+        self.busy.hide()
+        layout.addWidget(self.busy)
         self.input = QLineEdit()
         self.input.setMaxLength(2000)
-        self.input.setPlaceholderText("Try: open youtube")
+        self.input.setPlaceholderText("Ask JARVIS…  (Enter to send)")
         self.input.returnPressed.connect(self.submit)
-        row.addWidget(self.input)
-        self.send = QPushButton("Send")
-        self.send.clicked.connect(lambda: self.submit())
-        row.addWidget(self.send)
-        layout.addLayout(row)
+        layout.addWidget(self.input)
         self.confirm_row = QWidget()
         confirmation = QHBoxLayout(self.confirm_row)
-        yes, no = QPushButton("Confirm shutdown…"), QPushButton("Cancel")
+        confirmation.setContentsMargins(0, 0, 0, 0)
+        yes, = [QPushButton("Confirm shutdown…")]
+        no = QPushButton("Cancel")
         yes.clicked.connect(self.confirm)
         no.clicked.connect(self.cancel)
         confirmation.addWidget(yes)
         confirmation.addWidget(no)
+        confirmation.addStretch(1)
         layout.addWidget(self.confirm_row)
         self.confirm_row.hide()
-        if self.llm is not None:
-            welcome = ("Ready. Talk to me naturally, or try 'open firefox' / 'search cats'.\n"
-                       "Drag the orb to move it; right-click it for options.")
-        else:
-            welcome = ("Ready. Offline local mode: type a command like 'open firefox', or 'help'.\n"
-                       "Drag the orb to move it; right-click it for options.")
-        self.append("Jarvis", welcome)
+        self.busy_timer = QTimer(self)
+        self.busy_timer.timeout.connect(self._animate_busy)
+        self.busy_phase = 0
+        self.orb.set_busy(False)
+        self.append("Jarvis", "Ready. Ask me anything — try “open chatgpt” or “what time is it?”")
 
     def append(self, speaker, text):
         import html
-        self.history.append(f'<p><b style="color:#57dfed">{html.escape(speaker)}</b><br>'
-                            + html.escape(text).replace("\n", "<br>") + "</p>")
+        body = html.escape(text)
+        body = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", body)
+        body = body.replace("\n", "<br>")
+        color = "#57dfed" if speaker == "Jarvis" else "#9fb8cc"
+        self.history.append(
+            f'<p><span style="color:{color};font-weight:bold">{html.escape(speaker)}</span><br>{body}</p>'
+        )
         self.history.verticalScrollBar().setValue(self.history.verticalScrollBar().maximum())
+
+    def _animate_busy(self):
+        self.busy_phase = (self.busy_phase + 1) % 4
+        spinner = "◐◓◑◒"[self.busy_phase]
+        self.busy.setText(f"{spinner}  Jarvis is working…")
+
+    def _set_busy(self, busy):
+        self.input.setEnabled(not busy)
+        if busy:
+            self.busy_phase = 0
+            self.busy.setText("◐  Jarvis is working…")
+            self.busy.show()
+            self.busy_timer.start(180)
+        else:
+            self.busy_timer.stop()
+            self.busy.hide()
+        self.orb.set_busy(busy)
 
     def submit(self, text=None):
         if self.worker is not None:
@@ -224,27 +254,26 @@ class ChatPanel(QWidget):
             self.messages.append({"role": "user", "content": text})
             if len(self.messages) > 24:
                 del self.messages[: len(self.messages) - 24]
-            self.start_llm()
+            self.start_llm(force_action=bool(ACTION_INTENT_RE.search(text)))
         else:
             self.start_worker(text)
 
-    def _busy(self):
-        self.input.setEnabled(False)
-        self.send.setEnabled(False)
-
     def start_worker(self, command, confirmation=False):
-        self._busy()
+        self._set_busy(True)
         self.worker = CommandWorker(self.engine, command, confirmation, self)
         self.worker.completed.connect(self.received)
         self.worker.finished.connect(self.finished)
         self.worker.start()
 
-    def start_llm(self):
-        self._busy()
+    def start_llm(self, force_action=False):
+        self._set_busy(True)
         system = {"role": "system", "content": build_system_prompt()}
-        self.worker = LLMWorker(self.llm, self.engine, [system] + self.messages, self.model, self)
+        self.worker = LLMWorker(
+            self.llm, self.engine, [system] + self.messages, self.model,
+            force_action=force_action, parent=self,
+        )
         self.worker.reply.connect(self.on_llm_reply)
-        self.worker.actions.connect(lambda outcomes: None)
+        self.worker.action_done.connect(self.on_action_done)
         self.worker.need_confirm.connect(self.on_llm_confirm)
         self.worker.failed.connect(self.on_llm_failed)
         self.worker.finished.connect(self.finished)
@@ -262,6 +291,9 @@ class ChatPanel(QWidget):
         if len(self.messages) > 24:
             del self.messages[: len(self.messages) - 24]
 
+    def on_action_done(self, command, result_text):
+        self.append("Jarvis", f"✓  {result_text}")
+
     def on_llm_confirm(self, action):
         self.pending = action
         self.confirm_row.show()
@@ -277,8 +309,7 @@ class ChatPanel(QWidget):
             return
         self.worker.deleteLater()
         self.worker = None
-        self.input.setEnabled(True)
-        self.send.setEnabled(True)
+        self._set_busy(False)
         self.input.setFocus()
 
     def confirm(self):
@@ -294,12 +325,12 @@ class ChatPanel(QWidget):
 
     def show_near_orb(self):
         screen = self.orb.screen().availableGeometry()
-        self.resize(min(410, screen.width()), min(510, screen.height()))
+        self.resize(min(360, screen.width()), min(430, screen.height()))
         x = self.orb.x() - self.width() - 12
         if x < screen.left():
             x = self.orb.x() + self.orb.width() + 12
         x = max(screen.left(), min(x, screen.right() - self.width() + 1))
-        y = max(screen.top(), min(self.orb.y() - 100, screen.bottom() - self.height() + 1))
+        y = max(screen.top(), min(self.orb.y() - 90, screen.bottom() - self.height() + 1))
         self.move(x, y)
         self.show()
         self.raise_()
@@ -330,6 +361,7 @@ class Orb(QWidget):
         self.dragging = False
         self.press_position = None
         self.menu_open = False
+        self.busy = False
         screen = QApplication.primaryScreen().availableGeometry()
         self.anchor = QPoint(screen.right() - 112, screen.top() + screen.height() // 3)
         self.move(self.anchor)
@@ -338,8 +370,13 @@ class Orb(QWidget):
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
 
+    def set_busy(self, busy):
+        if getattr(self, "busy", None) != busy:
+            self.busy = busy
+            self.update()
+
     def tick(self):
-        self.phase += 0.045
+        self.phase += 0.09 if self.busy else 0.045
         self.update()
         if self.floating and self.press_position is None and not self.panel.isVisible() and not self.underMouse() and not self.menu_open:
             point = self.anchor + QPoint(round(7 * math.sin(self.phase / 3)), round(10 * math.sin(self.phase / 2)))
@@ -354,18 +391,20 @@ class Orb(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
+        accent = QColor(255, 176, 84) if self.busy else QColor(40, 220, 245)
         glow = QRadialGradient(43, 43, 43)
-        glow.setColorAt(0, QColor(40, 220, 245, 130))
-        glow.setColorAt(0.72, QColor(40, 220, 245, 75))
-        glow.setColorAt(1, QColor(40, 220, 245, 0))
+        glow.setColorAt(0, QColor(accent.red(), accent.green(), accent.blue(), 160 if self.busy else 130))
+        glow.setColorAt(0.72, QColor(accent.red(), accent.green(), accent.blue(), 95 if self.busy else 75))
+        glow.setColorAt(1, QColor(accent.red(), accent.green(), accent.blue(), 0))
         painter.setPen(Qt.NoPen)
         painter.setBrush(glow)
         painter.drawEllipse(QRectF(0, 0, 86, 86))
         painter.setBrush(QColor("#0c1c30"))
         painter.setPen(QPen(QColor("#5be6ef"), 2))
         painter.drawEllipse(QRectF(13, 13, 60, 60))
-        painter.setPen(QPen(QColor("#28889f"), 2))
-        painter.drawArc(QRectF(20, 20, 46, 46), int(self.phase * 140), 250 * 16)
+        sweep = 250 * 16 if not self.busy else 360 * 16
+        painter.setPen(QPen(QColor(accent), 3 if self.busy else 2))
+        painter.drawArc(QRectF(20, 20, 46, 46), int(self.phase * (300 if self.busy else 140)), sweep)
         painter.setPen(QColor("#d7fcff"))
         painter.setFont(QFont("Sans Serif", 20, QFont.Bold))
         painter.drawText(self.rect(), Qt.AlignCenter, "J")
