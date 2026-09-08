@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=JARVIS Assistant
+Comment=Floating local assistant for apps and websites
+Exec=/home/mvsr/jarvis/start_jarvis.sh
+Icon=system-run
+Terminal=false
+Categories=Utility;
+StartupNotify=false
+X-GNOME-Autostart-enabled=true
